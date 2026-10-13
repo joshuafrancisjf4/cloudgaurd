@@ -1,0 +1,24 @@
+﻿# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend dependencies and generated builds
+frontend/node_modules/
+frontend/dist/
+node_modules/
+dist/
+coverage/
+
+# Local scan targets and cloned repositories
+repositories/*
+
+# Logs
+*.log
+npm-debug.log*

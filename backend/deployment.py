@@ -1,10 +1,8 @@
-import re
-import socket
-import subprocess
-import uuid
-
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+import subprocess
+import os
+import re
 
 
 router = APIRouter(
@@ -13,238 +11,345 @@ router = APIRouter(
 )
 
 
+# --------------------------------------------------
+# REQUEST MODELS
+# --------------------------------------------------
+
+class BuildRequest(BaseModel):
+    repo_path: str
+
+
 class DeployRequest(BaseModel):
-    image_name: str
-    container_port: int = Field(default=3000, ge=1, le=65535)
-    host_port: int | None = Field(default=None, ge=1, le=65535)
+    repo_path: str
+    host_port: int = 8080
+    container_port: int = 8000
 
 
-class StopRequest(BaseModel):
-    container_name: str
+# --------------------------------------------------
+# HELPER - CREATE SAFE DOCKER NAME
+# --------------------------------------------------
+
+def create_safe_name(repo_path):
+    repo_name = os.path.basename(
+        os.path.normpath(repo_path)
+    )
+
+    safe_name = re.sub(
+        r"[^a-zA-Z0-9_.-]",
+        "-",
+        repo_name
+    ).lower()
+
+    return safe_name
 
 
-def run_command(command: list[str]):
+# --------------------------------------------------
+# CHECK DOCKER
+# --------------------------------------------------
+
+@router.get("/docker-status")
+def docker_status():
+
     try:
+
         result = subprocess.run(
-            command,
+            ["docker", "--version"],
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=10
         )
 
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
+        if result.returncode != 0:
+            return {
+                "status": "UNAVAILABLE",
+                "message": "Docker is not available.",
+                "error": result.stderr
+            }
 
-    except subprocess.TimeoutExpired:
+        return {
+            "status": "AVAILABLE",
+            "message": "Docker is installed.",
+            "docker_version": result.stdout.strip()
+        }
+
+    except FileNotFoundError:
+
+        return {
+            "status": "UNAVAILABLE",
+            "message": "Docker command was not found."
+        }
+
+    except Exception as error:
+
+        return {
+            "status": "ERROR",
+            "message": str(error)
+        }
+
+
+# --------------------------------------------------
+# BUILD DOCKER IMAGE
+# --------------------------------------------------
+
+@router.post("/build")
+def build_docker_image(request: BuildRequest):
+
+    repo_path = os.path.abspath(
+        request.repo_path
+    )
+
+    # ----------------------------------------------
+    # CHECK REPOSITORY
+    # ----------------------------------------------
+
+    if not os.path.isdir(repo_path):
+
         raise HTTPException(
-            status_code=500,
-            detail="Docker command timed out."
+            status_code=404,
+            detail="Repository folder does not exist."
+        )
+
+    # ----------------------------------------------
+    # CHECK DOCKERFILE
+    # ----------------------------------------------
+
+    dockerfile_path = os.path.join(
+        repo_path,
+        "Dockerfile"
+    )
+
+    if not os.path.isfile(dockerfile_path):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Dockerfile was not found in repository root."
+        )
+
+    # ----------------------------------------------
+    # IMAGE NAME
+    # ----------------------------------------------
+
+    repo_name = create_safe_name(repo_path)
+
+    image_name = f"cloudgaurd-{repo_name}:latest"
+
+    # ----------------------------------------------
+    # BUILD IMAGE
+    # ----------------------------------------------
+
+    try:
+
+        result = subprocess.run(
+            [
+                "docker",
+                "build",
+                "-t",
+                image_name,
+                "."
+            ],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=600
         )
 
     except FileNotFoundError:
+
         raise HTTPException(
             status_code=500,
-            detail="Docker is not installed or is not available in PATH."
+            detail=(
+                "Docker command was not found. "
+                "Make sure Docker Desktop is installed."
+            )
         )
 
+    except subprocess.TimeoutExpired:
 
-def docker_is_running():
-    code, _, _ = run_command(["docker", "info"])
-
-    if code != 0:
         raise HTTPException(
-            status_code=500,
-            detail="Docker Desktop is not running."
+            status_code=408,
+            detail="Docker image build timed out."
         )
 
+    # ----------------------------------------------
+    # BUILD FAILED
+    # ----------------------------------------------
 
-def validate_image_name(image_name: str):
-    if not re.fullmatch(
-        r"[A-Za-z0-9._/-]+(?::[A-Za-z0-9._-]+)?",
-        image_name
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Docker image name."
-        )
+    if result.returncode != 0:
+
+        return {
+            "status": "FAILED",
+            "message": "Docker image build failed.",
+            "image_name": image_name,
+            "error": result.stderr,
+            "logs": result.stdout
+        }
+
+    # ----------------------------------------------
+    # BUILD SUCCESS
+    # ----------------------------------------------
+
+    return {
+        "status": "SUCCESS",
+        "message": "Docker image built successfully.",
+        "image_name": image_name,
+        "logs": result.stdout
+    }
 
 
-def validate_container_name(container_name: str):
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container_name):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid container name."
-        )
-
-
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
+# --------------------------------------------------
+# DEPLOY / RUN DOCKER CONTAINER
+# --------------------------------------------------
 
 @router.post("/deploy")
 def deploy_container(request: DeployRequest):
 
-    docker_is_running()
+    repo_path = os.path.abspath(
+        request.repo_path
+    )
 
-    validate_image_name(request.image_name)
+    if not os.path.isdir(repo_path):
 
-    # Check whether Docker image exists
-    code, _, error = run_command(
+        raise HTTPException(
+            status_code=404,
+            detail="Repository folder does not exist."
+        )
+
+    repo_name = create_safe_name(repo_path)
+
+    image_name = f"cloudgaurd-{repo_name}:latest"
+
+    container_name = f"cloudgaurd-{repo_name}"
+
+    # ----------------------------------------------
+    # CHECK IMAGE EXISTS
+    # ----------------------------------------------
+
+    image_check = subprocess.run(
         [
             "docker",
             "image",
             "inspect",
-            request.image_name
-        ]
+            image_name
+        ],
+        capture_output=True,
+        text=True
     )
 
-    if code != 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Docker image '{request.image_name}' was not found."
-        )
+    if image_check.returncode != 0:
 
-    # Automatically choose a free port if user does not provide one
-    host_port = request.host_port or find_free_port()
-
-    container_name = (
-        "cloudguard-"
-        + uuid.uuid4().hex[:8]
-    )
-
-    command = [
-        "docker",
-        "run",
-        "-d",
-        "--name",
-        container_name,
-        "-p",
-        f"{host_port}:{request.container_port}",
-        request.image_name
-    ]
-
-    code, container_id, error = run_command(command)
-
-    if code != 0:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Deployment failed.",
-                "docker_error": error
-            }
-        )
-
-    return {
-        "status": "success",
-        "message": "Application deployed successfully.",
-        "image": request.image_name,
-        "container_name": container_name,
-        "container_id": container_id,
-        "container_port": request.container_port,
-        "host_port": host_port,
-        "live_url": f"http://localhost:{host_port}"
-    }
-
-
-@router.get("/containers")
-def list_cloudguard_containers():
-
-    docker_is_running()
-
-    code, output, error = run_command(
-        [
-            "docker",
-            "ps",
-            "-a",
-            "--filter",
-            "name=cloudguard-",
-            "--format",
-            "{{.Names}} | {{.Image}} | {{.Status}} | {{.Ports}}"
-        ]
-    )
-
-    if code != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=error
-        )
-
-    containers = []
-
-    if output:
-        containers = output.splitlines()
-
-    return {
-        "status": "success",
-        "containers": containers
-    }
-
-
-@router.post("/stop")
-def stop_container(request: StopRequest):
-
-    docker_is_running()
-
-    validate_container_name(request.container_name)
-
-    if not request.container_name.startswith("cloudguard-"):
         raise HTTPException(
             status_code=400,
-            detail="CloudGuard can only stop containers created by CloudGuard."
+            detail=(
+                "Docker image does not exist. "
+                "Build the image before deployment."
+            )
         )
 
-    code, _, error = run_command(
-        [
-            "docker",
-            "stop",
-            request.container_name
-        ]
-    )
+    # ----------------------------------------------
+    # REMOVE OLD CONTAINER
+    # ----------------------------------------------
 
-    if code != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=error
-        )
-
-    return {
-        "status": "success",
-        "message": "Container stopped successfully.",
-        "container_name": request.container_name
-    }
-
-
-@router.delete("/remove/{container_name}")
-def remove_container(container_name: str):
-
-    docker_is_running()
-
-    validate_container_name(container_name)
-
-    if not container_name.startswith("cloudguard-"):
-        raise HTTPException(
-            status_code=400,
-            detail="CloudGuard can only remove containers created by CloudGuard."
-        )
-
-    code, _, error = run_command(
+    subprocess.run(
         [
             "docker",
             "rm",
             "-f",
             container_name
-        ]
+        ],
+        capture_output=True,
+        text=True
     )
 
-    if code != 0:
+    # ----------------------------------------------
+    # START NEW CONTAINER
+    # ----------------------------------------------
+
+    try:
+
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                container_name,
+                "-p",
+                f"{request.host_port}:{request.container_port}",
+                image_name
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+    except subprocess.TimeoutExpired:
+
         raise HTTPException(
-            status_code=500,
-            detail=error
+            status_code=408,
+            detail="Container deployment timed out."
+        )
+
+    # ----------------------------------------------
+    # DEPLOYMENT FAILED
+    # ----------------------------------------------
+
+    if result.returncode != 0:
+
+        return {
+            "status": "FAILED",
+            "message": "Container deployment failed.",
+            "image_name": image_name,
+            "container_name": container_name,
+            "error": result.stderr
+        }
+
+    # ----------------------------------------------
+    # DEPLOYMENT SUCCESS
+    # ----------------------------------------------
+
+    container_id = result.stdout.strip()
+
+    return {
+        "status": "SUCCESS",
+        "message": "Application deployed successfully.",
+        "image_name": image_name,
+        "container_name": container_name,
+        "container_id": container_id,
+        "host_port": request.host_port,
+        "container_port": request.container_port,
+        "application_url": (
+            f"http://localhost:{request.host_port}"
+        )
+    }
+
+
+# --------------------------------------------------
+# STOP DEPLOYMENT
+# --------------------------------------------------
+
+@router.delete("/stop/{container_name}")
+def stop_container(container_name: str):
+
+    result = subprocess.run(
+        [
+            "docker",
+            "rm",
+            "-f",
+            container_name
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+
+        raise HTTPException(
+            status_code=400,
+            detail=result.stderr
         )
 
     return {
-        "status": "success",
-        "message": "Container removed successfully.",
+        "status": "SUCCESS",
+        "message": "Deployment stopped.",
         "container_name": container_name
     }
